@@ -1,68 +1,84 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Tone from "tone";
 
-type PerformanceKey = {
-  key: string;
-  note: string;
-  traceNote: string;
-  label: string;
+type Digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+type DialPhase = "idle" | "dialing" | "returning";
+
+type LineAudio = {
+  limiter: Tone.Limiter;
+  masterGain: Tone.Gain;
+  filter: Tone.Filter;
+  delay: Tone.FeedbackDelay;
+  reverb: Tone.Reverb;
+  lineGain: Tone.Gain;
+  signalGain: Tone.Gain;
+  linePan: Tone.Panner;
+  signalPan: Tone.Panner;
+  lineSynth: Tone.PolySynth;
+  signalSynth: Tone.Synth;
+  loop: Tone.Loop;
 };
 
-const PERFORMANCE_KEYS: PerformanceKey[] = [
-  { key: "A", note: "F4", traceNote: "F2", label: "F" },
-  { key: "S", note: "Ab4", traceNote: "Ab2", label: "A♭" },
-  { key: "D", note: "Bb4", traceNote: "Bb2", label: "B♭" },
-  { key: "F", note: "C5", traceNote: "C3", label: "C" },
-  { key: "G", note: "Eb5", traceNote: "Eb3", label: "E♭" },
-  { key: "H", note: "F5", traceNote: "F3", label: "F" },
-  { key: "J", note: "Ab5", traceNote: "Ab3", label: "A♭" },
-  { key: "K", note: "Bb5", traceNote: "Bb3", label: "B♭" },
-];
+const DIAL_DIGITS: Digit[] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+const MAX_DIGITS = 6;
+const TEMPO = 72;
+const LINE_FREQUENCY = 425;
 
-const KEY_MAP = Object.fromEntries(
-  PERFORMANCE_KEYS.map((performanceKey) => [
-    performanceKey.key.toLowerCase(),
-    performanceKey,
-  ]),
-) as Record<string, PerformanceKey>;
+// A symmetrical pentatonic family tuned around the 425 Hz line signal.
+const DIGIT_FREQUENCIES: Record<Digit, number> = {
+  "0": 425,
+  "1": 505,
+  "2": 567,
+  "3": 637,
+  "4": 757,
+  "5": 850,
+  "6": 757,
+  "7": 637,
+  "8": 567,
+  "9": 505,
+};
 
-const EMPTY_TRACE: Array<string | null> = Array.from({ length: 8 }, () => null);
-const TEMPO = 90;
-
-function noteLabel(note: string | null) {
-  return note ? note.replace("b", "♭").replace(/\d/g, "") : "—";
-}
-
-function distanceName(distance: number) {
-  if (distance < 34) return "NOW";
-  if (distance < 68) return "TRACE";
-  return "GONE";
+function pulseCount(digit: Digit) {
+  return digit === "0" ? 10 : Number(digit);
 }
 
 export default function Home() {
   const [ready, setReady] = useState(false);
-  const [playing, setPlaying] = useState(false);
+  const [lineOpen, setLineOpen] = useState(false);
+  const [digits, setDigits] = useState<Digit[]>([]);
   const [activeStep, setActiveStep] = useState(-1);
-  const [audioError, setAudioError] = useState("");
-  const [memoryNotes, setMemoryNotes] = useState<Array<string | null>>([
-    ...EMPTY_TRACE,
-  ]);
-  const [capturing, setCapturing] = useState(false);
-  const [captureIndex, setCaptureIndex] = useState(-1);
-  const [distance, setDistance] = useState(28);
+  const [dialPhase, setDialPhase] = useState<DialPhase>("idle");
+  const [activeDigit, setActiveDigit] = useState<Digit | null>(null);
+  const [dialRotation, setDialRotation] = useState(0);
+  const [lineHint, setLineHint] = useState("");
+  const [distance, setDistance] = useState(24);
   const [master, setMaster] = useState(72);
-  const [pressedNotes, setPressedNotes] = useState<string[]>([]);
+  const [audioError, setAudioError] = useState("");
 
-  const audio = useRef<any>(null);
-  const held = useRef(new Set<string>());
-  const requestedNotes = useRef(new Set<string>());
+  const audio = useRef<LineAudio | null>(null);
+  const digitsRef = useRef<Digit[]>([]);
   const currentStep = useRef(0);
-  const memoryNotesRef = useRef<Array<string | null>>([...EMPTY_TRACE]);
-  const captureIndexRef = useRef(-1);
+  const dialPhaseRef = useRef<DialPhase>("idle");
+  const lineOpenRef = useRef(false);
   const unlockPromise = useRef<Promise<void> | null>(null);
   const starting = useRef(false);
+  const timers = useRef<number[]>([]);
+
+  const clearTimers = useCallback(() => {
+    timers.current.forEach((timer) => window.clearTimeout(timer));
+    timers.current = [];
+  }, []);
+
+  const later = useCallback((callback: () => void, delay: number) => {
+    const timer = window.setTimeout(() => {
+      timers.current = timers.current.filter((item) => item !== timer);
+      callback();
+    }, delay);
+    timers.current.push(timer);
+    return timer;
+  }, []);
 
   const unlockAudio = useCallback(() => {
     if (Tone.getContext().state === "running") return Promise.resolve();
@@ -71,7 +87,7 @@ export default function Home() {
       unlockPromise.current = Tone.start()
         .then(() => {
           if (Tone.getContext().state !== "running") {
-            throw new Error("Audio is still suspended. Press a key again.");
+            throw new Error("Линия не открылась. Нажмите ещё раз.");
           }
         })
         .finally(() => {
@@ -88,176 +104,108 @@ export default function Home() {
     const d = distance / 100;
     const limiter = new Tone.Limiter(-1).toDestination();
     const masterGain = new Tone.Gain(master / 100).connect(limiter);
-
-    const panNodeA = new Tone.Panner(-0.08 - d * 0.28).connect(masterGain);
-    const presentGain = new Tone.Gain(0.9 - d * 0.42).connect(panNodeA);
-    const delayNode = new Tone.FeedbackDelay({
+    const reverb = new Tone.Reverb({
+      decay: 1.3 + d * 3.5,
+      wet: 0.06 + d * 0.42,
+    }).connect(masterGain);
+    const delay = new Tone.FeedbackDelay({
       delayTime: "8n",
-      feedback: 0.12 + d * 0.43,
-      wet: 0.04 + d * 0.48,
-    }).connect(presentGain);
-    const chorusNode = new Tone.Chorus({
-      frequency: 2.2,
-      delayTime: 2.5,
-      depth: 0.18 + d * 0.64,
-      wet: 0.05 + d * 0.38,
-    })
-      .connect(delayNode)
-      .start();
-    const filterA = new Tone.Filter({
-      frequency: 9000 - d * 7600,
+      feedback: 0.08 + d * 0.24,
+      wet: 0.04 + d * 0.24,
+    }).connect(reverb);
+    const filter = new Tone.Filter({
       type: "lowpass",
-      Q: 1.2 + d * 2.8,
-    }).connect(chorusNode);
-    const synthA = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: "triangle" },
-      envelope: { attack: 0.035, decay: 0.24, sustain: 0.58, release: 0.8 },
-    }).connect(filterA);
+      frequency: 2900 - d * 1350,
+      Q: 0.75 + d * 1.1,
+    }).connect(delay);
 
-    const panNodeB = new Tone.Panner(0.08 + d * 0.28).connect(masterGain);
-    const memoryGain = new Tone.Gain(0.22 + d * 0.62).connect(panNodeB);
-    const reverbNode = new Tone.Reverb({
-      decay: 2.1 + d * 3.2,
-      wet: 0.08 + d * 0.58,
-    }).connect(memoryGain);
-    const distortionNode = new Tone.Distortion({
-      distortion: 0.05 + d * 0.55,
-      wet: 0.64,
-    }).connect(reverbNode);
-    const filterB = new Tone.Filter({
-      frequency: 2200 - d * 1550,
-      type: "lowpass",
-      Q: 4.5,
-    }).connect(distortionNode);
-    const synthB = new Tone.MonoSynth({
-      oscillator: { type: "square" },
-      envelope: { attack: 0.01, decay: 0.18, sustain: 0.32, release: 0.24 },
-    }).connect(filterB);
+    const linePan = new Tone.Panner(-0.025 - d * 0.08).connect(filter);
+    const signalPan = new Tone.Panner(0.025 + d * 0.08).connect(filter);
+    const lineGain = new Tone.Gain(0.64).connect(linePan);
+    const signalGain = new Tone.Gain(0.18).connect(signalPan);
+
+    const lineSynth = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: "triangle" },
+      envelope: { attack: 0.018, decay: 0.16, sustain: 0.28, release: 0.55 },
+    }).connect(lineGain);
+    const signalSynth = new Tone.Synth({
+      oscillator: { type: "triangle" },
+      envelope: { attack: 0.002, decay: 0.055, sustain: 0.04, release: 0.08 },
+    }).connect(signalGain);
 
     const loop = new Tone.Loop((time) => {
-      const step = currentStep.current % 8;
-      const traceNote = memoryNotesRef.current[step];
-      setActiveStep(step);
+      const step = currentStep.current % MAX_DIGITS;
+      const digit = digitsRef.current[step];
 
-      if (traceNote) {
-        synthB.triggerAttackRelease(
-          traceNote,
-          "16n",
-          time,
-          step === 0 || step === 4 ? 0.86 : 0.68,
-        );
+      Tone.Draw.schedule(() => {
+        if (lineOpenRef.current) setActiveStep(step);
+      }, time);
+
+      if (digit) {
+        const frequency = DIGIT_FREQUENCIES[digit];
+        lineSynth.triggerAttackRelease(frequency, "8n", time, 0.72);
+
       }
 
-      currentStep.current = (step + 1) % 8;
-    }, "8n");
+      currentStep.current = (step + 1) % MAX_DIGITS;
+    }, "4n");
 
     const transport = Tone.getTransport();
     transport.bpm.value = TEMPO;
-    transport.swing = 0.02 + d * 0.34;
-    transport.swingSubdivision = "8n";
+    transport.swing = 0;
+    transport.position = 0;
 
     audio.current = {
       limiter,
       masterGain,
-      panNodeA,
-      presentGain,
-      delayNode,
-      chorusNode,
-      filterA,
-      synthA,
-      panNodeB,
-      memoryGain,
-      reverbNode,
-      distortionNode,
-      filterB,
-      synthB,
+      filter,
+      delay,
+      reverb,
+      lineGain,
+      signalGain,
+      linePan,
+      signalPan,
+      lineSynth,
+      signalSynth,
       loop,
     };
-
     setReady(true);
     return audio.current;
   }, [distance, master]);
 
-  const recordTraceNote = useCallback((traceNote: string) => {
-    const index = captureIndexRef.current;
-    if (index < 0 || index > 7) return;
+  const updateDigits = useCallback((nextDigits: Digit[]) => {
+    const normalized = nextDigits.slice(-MAX_DIGITS);
+    digitsRef.current = normalized;
+    setDigits(normalized);
+  }, []);
 
-    const nextTrace = [...memoryNotesRef.current];
-    nextTrace[index] = traceNote;
-    memoryNotesRef.current = nextTrace;
-    setMemoryNotes(nextTrace);
+  const stopLine = useCallback((withClick = true) => {
+    const currentAudio = audio.current;
+    const transport = Tone.getTransport();
 
-    const nextIndex = index + 1;
-    if (nextIndex >= 8) {
-      captureIndexRef.current = -1;
-      setCaptureIndex(-1);
-      setCapturing(false);
-      return;
+    if (currentAudio) {
+      transport.stop();
+      transport.position = 0;
+      currentAudio.loop.stop();
+      currentAudio.loop.cancel(0);
+      currentAudio.lineSynth.releaseAll();
+      currentAudio.signalSynth.triggerRelease();
+
+      if (withClick && Tone.getContext().state === "running") {
+        currentAudio.signalSynth.triggerAttackRelease(LINE_FREQUENCY, "64n", Tone.now(), 0.34);
+      }
     }
 
-    captureIndexRef.current = nextIndex;
-    setCaptureIndex(nextIndex);
-  }, []);
+    lineOpenRef.current = false;
+    currentStep.current = 0;
+    setLineOpen(false);
+    setActiveStep(-1);
+    setLineHint("СВЯЗЬ ЗАВЕРШЕНА");
+    later(() => setLineHint(""), 1200);
+  }, [later]);
 
-  const noteOn = useCallback(
-    async (performanceKey: PerformanceKey) => {
-      const { note, traceNote } = performanceKey;
-      requestedNotes.current.add(note);
-      setPressedNotes((current) =>
-        current.includes(note) ? current : [...current, note],
-      );
-      recordTraceNote(traceNote);
-
-      try {
-        const unlock = unlockAudio();
-        setAudioError("");
-        await unlock;
-        const currentAudio = initAudio();
-        if (requestedNotes.current.has(note)) {
-          currentAudio.synthA.triggerAttack(note);
-        }
-      } catch (error) {
-        setAudioError(
-          error instanceof Error ? error.message : "Audio could not start",
-        );
-      }
-    },
-    [initAudio, recordTraceNote, unlockAudio],
-  );
-
-  const noteOff = useCallback((note: string) => {
-    requestedNotes.current.delete(note);
-    setPressedNotes((current) => current.filter((item) => item !== note));
-    audio.current?.synthA.triggerRelease(note);
-  }, []);
-
-  const beginCapture = useCallback(() => {
-    const emptyTrace = [...EMPTY_TRACE];
-    memoryNotesRef.current = emptyTrace;
-    setMemoryNotes(emptyTrace);
-    captureIndexRef.current = 0;
-    setCaptureIndex(0);
-    setCapturing(true);
-  }, []);
-
-  const holdCapture = useCallback(() => {
-    captureIndexRef.current = -1;
-    setCaptureIndex(-1);
-    setCapturing(false);
-  }, []);
-
-  const clearTrace = useCallback(() => {
-    const emptyTrace = [...EMPTY_TRACE];
-    memoryNotesRef.current = emptyTrace;
-    setMemoryNotes(emptyTrace);
-    captureIndexRef.current = -1;
-    setCaptureIndex(-1);
-    setCapturing(false);
-    audio.current?.synthB.triggerRelease();
-  }, []);
-
-  const startPlayback = useCallback(async () => {
-    if (playing || starting.current) return;
+  const startLine = useCallback(async () => {
+    if (starting.current || lineOpenRef.current) return;
     starting.current = true;
 
     try {
@@ -265,308 +213,339 @@ export default function Home() {
       setAudioError("");
       await unlock;
       const currentAudio = initAudio();
-      currentStep.current = 0;
-      currentAudio.loop.start(0);
-      Tone.getTransport().start();
-      setPlaying(true);
-    } catch (error) {
-      setPlaying(false);
-      setAudioError(
-        error instanceof Error ? error.message : "Audio could not start",
-      );
-    } finally {
-      starting.current = false;
-    }
-  }, [initAudio, playing, unlockAudio]);
 
-  const stopPlayback = useCallback(() => {
-    const currentAudio = audio.current;
-    if (currentAudio) {
-      Tone.getTransport().stop();
-      currentAudio.loop.stop();
-      currentAudio.synthB.triggerRelease();
-    }
-
-    currentStep.current = 0;
-    setActiveStep(-1);
-    setPlaying(false);
-  }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      const performanceKey = KEY_MAP[event.key.toLowerCase()];
-      if (!performanceKey || event.repeat || held.current.has(performanceKey.note)) {
+      if (digitsRef.current.length === 0) {
+        currentAudio.lineSynth.triggerAttackRelease(LINE_FREQUENCY, 0.8, Tone.now(), 0.42);
+        setLineHint("СИГНАЛ 425 ГЦ — НАБЕРИТЕ НОМЕР");
+        later(() => setLineHint(""), 1700);
         return;
       }
 
-      held.current.add(performanceKey.note);
-      void noteOn(performanceKey);
-    };
+      const transport = Tone.getTransport();
+      transport.stop();
+      transport.position = 0;
+      currentAudio.loop.stop();
+      currentAudio.loop.cancel(0);
+      currentAudio.loop.start(0);
+      currentStep.current = 0;
+      lineOpenRef.current = true;
+      setLineOpen(true);
+      setActiveStep(0);
+      setLineHint("");
+      transport.start();
+    } catch (error) {
+      setAudioError(error instanceof Error ? error.message : "Не удалось открыть линию.");
+    } finally {
+      starting.current = false;
+    }
+  }, [initAudio, later, unlockAudio]);
 
-    const handleKeyUp = (event: KeyboardEvent) => {
-      const performanceKey = KEY_MAP[event.key.toLowerCase()];
-      if (!performanceKey) return;
-      held.current.delete(performanceKey.note);
-      noteOff(performanceKey.note);
-    };
+  const toggleLine = useCallback(() => {
+    if (lineOpenRef.current) {
+      stopLine();
+      return;
+    }
 
-    const releaseAll = () => {
-      held.current.clear();
-      requestedNotes.current.clear();
-      setPressedNotes([]);
-      audio.current?.synthA.releaseAll();
+    void startLine();
+  }, [startLine, stopLine]);
+
+  const dialDigit = useCallback(async (digit: Digit) => {
+    if (dialPhaseRef.current !== "idle") return;
+    dialPhaseRef.current = "dialing";
+    setDialPhase("dialing");
+    setActiveDigit(digit);
+
+    const pulses = pulseCount(digit);
+    setDialRotation(24 + pulses * 21);
+
+    try {
+      const unlock = unlockAudio();
+      setAudioError("");
+      await unlock;
+      const currentAudio = initAudio();
+
+      later(() => {
+        dialPhaseRef.current = "returning";
+        setDialPhase("returning");
+        setDialRotation(0);
+
+        for (let index = 0; index < pulses; index += 1) {
+          later(() => {
+            if (dialPhaseRef.current === "returning") {
+              currentAudio.signalSynth.triggerAttackRelease(
+                LINE_FREQUENCY,
+                "128n",
+                Tone.now(),
+                0.2,
+              );
+            }
+          }, 15 + index * 47);
+        }
+
+        const returnDuration = 160 + pulses * 42;
+        later(() => {
+          updateDigits([...digitsRef.current, digit]);
+          currentAudio.lineSynth.triggerAttackRelease(
+            DIGIT_FREQUENCIES[digit],
+            "8n",
+            Tone.now(),
+            0.62,
+          );
+          dialPhaseRef.current = "idle";
+          setDialPhase("idle");
+          setActiveDigit(null);
+        }, returnDuration);
+      }, 170);
+    } catch (error) {
+      dialPhaseRef.current = "idle";
+      setDialPhase("idle");
+      setActiveDigit(null);
+      setDialRotation(0);
+      setAudioError(error instanceof Error ? error.message : "Диск не отвечает.");
+    }
+  }, [initAudio, later, unlockAudio, updateDigits]);
+
+  const clearNumber = useCallback(() => {
+    clearTimers();
+    audio.current?.signalSynth.triggerRelease(Tone.now());
+    dialPhaseRef.current = "idle";
+    setDialPhase("idle");
+    setDialRotation(0);
+    setActiveDigit(null);
+    if (lineOpenRef.current) stopLine(false);
+    updateDigits([]);
+    setActiveStep(-1);
+    setLineHint("НОМЕР СБРОШЕН");
+    later(() => setLineHint(""), 1000);
+  }, [clearTimers, later, stopLine, updateDigits]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.repeat) return;
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        clearNumber();
+        return;
+      }
+
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("button, input")) return;
+
+      if (/^[0-9]$/.test(event.key)) {
+        event.preventDefault();
+        void dialDigit(event.key as Digit);
+        return;
+      }
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        toggleLine();
+      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-    window.addEventListener("blur", releaseAll);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-      window.removeEventListener("blur", releaseAll);
-    };
-  }, [noteOff, noteOn]);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [clearNumber, dialDigit, toggleLine]);
 
   useEffect(() => {
     const currentAudio = audio.current;
     if (!currentAudio) return;
 
     const d = distance / 100;
-    currentAudio.presentGain.gain.rampTo(0.9 - d * 0.42, 0.08);
-    currentAudio.memoryGain.gain.rampTo(0.22 + d * 0.62, 0.08);
-    currentAudio.filterA.frequency.rampTo(9000 - d * 7600, 0.08);
-    currentAudio.filterA.Q.rampTo(1.2 + d * 2.8, 0.08);
-    currentAudio.chorusNode.wet.rampTo(0.05 + d * 0.38, 0.08);
-    currentAudio.chorusNode.depth = 0.18 + d * 0.64;
-    currentAudio.delayNode.wet.rampTo(0.04 + d * 0.48, 0.08);
-    currentAudio.delayNode.feedback.rampTo(0.12 + d * 0.43, 0.08);
-    currentAudio.panNodeA.pan.rampTo(-0.08 - d * 0.28, 0.08);
-    currentAudio.filterB.frequency.rampTo(2200 - d * 1550, 0.08);
-    currentAudio.distortionNode.distortion = 0.05 + d * 0.55;
-    currentAudio.reverbNode.wet.rampTo(0.08 + d * 0.58, 0.08);
-    currentAudio.panNodeB.pan.rampTo(0.08 + d * 0.28, 0.08);
-    Tone.getTransport().swing = 0.02 + d * 0.34;
+    currentAudio.filter.frequency.rampTo(2900 - d * 1350, 0.12);
+    currentAudio.filter.Q.rampTo(0.75 + d * 1.1, 0.12);
+    currentAudio.delay.wet.rampTo(0.04 + d * 0.24, 0.12);
+    currentAudio.delay.feedback.rampTo(0.08 + d * 0.24, 0.12);
+    currentAudio.reverb.wet.rampTo(0.06 + d * 0.42, 0.12);
+    currentAudio.linePan.pan.rampTo(-0.025 - d * 0.08, 0.12);
+    currentAudio.signalPan.pan.rampTo(0.025 + d * 0.08, 0.12);
   }, [distance, ready]);
 
   useEffect(() => {
-    audio.current?.masterGain.gain.rampTo(master / 100, 0.08);
+    audio.current?.masterGain.gain.rampTo(master / 100, 0.1);
   }, [master, ready]);
 
-  useEffect(
-    () => () => {
-      const currentAudio = audio.current;
+  useEffect(() => () => {
+    clearTimers();
+    const currentAudio = audio.current;
+    if (!currentAudio) return;
 
-      try {
-        currentAudio?.loop.stop();
-        currentAudio?.loop.dispose();
-        const transport = Tone.getTransport();
-        transport.stop();
-        transport.cancel(0);
+    try {
+      const transport = Tone.getTransport();
+      transport.stop();
+      transport.cancel(0);
+      currentAudio.loop.stop();
+      currentAudio.loop.dispose();
+      currentAudio.lineSynth.releaseAll();
 
-        if (currentAudio) {
-          [
-            currentAudio.synthA,
-            currentAudio.filterA,
-            currentAudio.chorusNode,
-            currentAudio.delayNode,
-            currentAudio.presentGain,
-            currentAudio.panNodeA,
-            currentAudio.synthB,
-            currentAudio.filterB,
-            currentAudio.distortionNode,
-            currentAudio.reverbNode,
-            currentAudio.memoryGain,
-            currentAudio.panNodeB,
-            currentAudio.masterGain,
-            currentAudio.limiter,
-          ].forEach((node) => node.dispose?.());
-        }
-      } catch {
-        // Tone nodes may already be disposed during a development hot reload.
-      }
+      [
+        currentAudio.lineSynth,
+        currentAudio.signalSynth,
+        currentAudio.lineGain,
+        currentAudio.signalGain,
+        currentAudio.linePan,
+        currentAudio.signalPan,
+        currentAudio.filter,
+        currentAudio.delay,
+        currentAudio.reverb,
+        currentAudio.masterGain,
+        currentAudio.limiter,
+      ].forEach((node) => node.dispose());
+    } catch {
+      // Development hot reload can dispose Tone nodes before React cleanup.
+    }
 
-      audio.current = null;
-    },
-    [],
-  );
+    audio.current = null;
+  }, [clearTimers]);
 
-  const recordedCount = memoryNotes.filter(Boolean).length;
+  const status = useMemo(() => {
+    if (lineHint) return lineHint;
+    if (lineOpen) return "ЛИНИЯ ОТКРЫТА";
+    if (dialPhase !== "idle") return `НАБОР ${activeDigit ?? ""}`;
+    if (digits.length === MAX_DIGITS) return "НОМЕР ГОТОВ";
+    if (digits.length > 0) return `НОМЕР ГОТОВ · ${digits.length}/${MAX_DIGITS}`;
+    return "СВОБОДНО";
+  }, [activeDigit, dialPhase, digits.length, lineHint, lineOpen]);
+
+  const slots = Array.from({ length: MAX_DIGITS }, (_, index) => digits[index] ?? null);
+  const handsetLabel = lineOpen
+    ? "Положить трубку и остановить мелодию"
+    : digits.length
+      ? "Поднять трубку и запустить мелодию"
+      : "Проверить сигнал линии 425 герц";
+
   return (
-    <main className="nachklang-stage">
-      <section className="nachklang-shell" aria-label="NACHKLANG musical instrument">
-        <header className="nachklang-header">
-          <div className="nachklang-brand">
-            <p className="nachklang-overline">TONWERK / INSTRUMENT 01</p>
-            <h1>NACHKLANG</h1>
-            <p className="nachklang-subtitle">an instrument for present and memory</p>
+    <main className="line-stage">
+      <section className={`line-shell ${lineOpen ? "is-open" : ""}`} aria-label="Музыкальный телефон ЛИНИЯ 425">
+        <header className="phone-header">
+          <div className="line-brand">
+            <p>TONWERK / АППАРАТ 02</p>
+            <h1>ЛИНИЯ <span>425</span></h1>
+            <small>музыкальная связь с прошлым</small>
           </div>
 
-          <div className="nachklang-status" aria-live="polite">
-            <span className={`nachklang-status-light ${ready ? "is-ready" : ""}`} />
-            <span>{ready ? "AUDIO READY" : "PRESS A KEY"}</span>
+          <div className="line-status" role="status" aria-live="polite">
+            <i className={lineOpen || dialPhase !== "idle" ? "is-active" : ""} aria-hidden="true" />
+            <div><span>СОСТОЯНИЕ</span><strong>{status}</strong></div>
           </div>
         </header>
 
-        <section className="distance-section" aria-labelledby="distance-title">
-          <div className="distance-copy distance-copy-now">
-            <span>01</span>
-            <h2>NOW</h2>
-            <p>what your hands make</p>
+        <button
+          type="button"
+          className={`handset-button ${lineOpen ? "is-open" : ""} ${lineHint.includes("425") ? "is-active" : ""}`}
+          aria-label={handsetLabel}
+          aria-pressed={lineOpen}
+          disabled={dialPhase !== "idle"}
+          onClick={toggleLine}
+        >
+          <span className="handset-cup handset-cup-left" aria-hidden="true"><i /></span>
+          <span className="handset-grip">
+            <b>{lineOpen ? "ПОЛОЖИТЬ ТРУБКУ" : "ПОДНЯТЬ ТРУБКУ"}</b>
+            <small>{lineOpen ? "РАЗОРВАТЬ СВЯЗЬ" : "СЛУШАТЬ НОМЕР"}</small>
+          </span>
+          <span className="handset-cup handset-cup-right" aria-hidden="true"><i /></span>
+        </button>
+
+        <section className="phone-body">
+          <div className="number-display" aria-label="Набранный номер">
+            <span>НАБРАННЫЙ НОМЕР</span>
+            <div className="number-slots" aria-live="polite">
+              {slots.map((digit, index) => (
+                <b
+                  key={index}
+                  className={`number-slot ${digit ? "is-active" : ""} ${lineOpen && activeStep === index ? "is-playing" : ""}`}
+                >
+                  {digit ?? "—"}
+                </b>
+              ))}
+            </div>
+            <small>{digits.length ? "ПРОБЕЛ — ТРУБКА" : "ПРИМЕР ДЛЯ НАБОРА: 12 04 61"}</small>
           </div>
 
-          <label
-            className="distance-control"
-            style={
-              {
-                "--distance-position": `${distance}%`,
-              } as React.CSSProperties
-            }
-          >
-            <span className="distance-label" id="distance-title">DISTANCE</span>
-            <span className="distance-rail" aria-hidden="true"><i /></span>
-            <input
-              className="distance-input"
-              aria-label="Distance between present and memory"
-              type="range"
-              min="0"
-              max="100"
-              value={distance}
-              onChange={(event) => setDistance(Number(event.target.value))}
-            />
-            <output className="distance-output">{distanceName(distance)}</output>
-            <span className="distance-scale" aria-hidden="true">
-              <b>NOW</b><b>TRACE</b><b>GONE</b>
-            </span>
-          </label>
-
-          <div className="distance-copy distance-copy-trace">
-            <span>02</span>
-            <h2>TRACE</h2>
-            <p>what the machine remembers</p>
-          </div>
-        </section>
-
-        <section className="trace-section" aria-labelledby="trace-title">
-          <header className="trace-header">
-            <div><span>02 / MEMORY</span><h2 id="trace-title">TRACE</h2></div>
-            <p aria-live="polite">
-              {capturing
-                ? `CAPTURING ${captureIndex + 1} OF 8`
-                : recordedCount
-                  ? `${recordedCount} NOTES HELD`
-                  : "EMPTY — CAPTURE EIGHT NOTES"}
-            </p>
-          </header>
-
-          <ol className="trace-cells" aria-label="Eight recorded trace notes">
-            {memoryNotes.map((note, index) => (
-              <li
-                key={index}
-                className={`${note ? "is-filled" : ""} ${activeStep === index ? "is-playing" : ""} ${captureIndex === index ? "is-armed" : ""}`}
-                aria-current={activeStep === index ? "step" : undefined}
-                aria-label={`Trace step ${index + 1}: ${note ?? "empty"}`}
-              >
-                <span>{String(index + 1).padStart(2, "0")}</span>
-                <strong>{noteLabel(note)}</strong>
-                <i aria-hidden="true" />
-              </li>
-            ))}
-          </ol>
-        </section>
-
-        <section className="performance-section" aria-labelledby="now-title">
-          <header className="performance-header">
-            <div><span>01 / HANDS</span><h2 id="now-title">NOW</h2></div>
-            <p>F MINOR / A S D F G H J K</p>
-          </header>
-
-          <div className="performance-keys" role="group" aria-label="F minor performance keys">
-            {PERFORMANCE_KEYS.map((performanceKey) => {
-              const pressed = pressedNotes.includes(performanceKey.note);
-
-              return (
+          <div className="rotary-wrap" aria-label="Дисковый номеронабиратель">
+            <div
+              className={`rotary-dial ${dialPhase === "dialing" ? "is-dialing" : ""} ${dialPhase === "returning" ? "is-returning" : ""}`}
+              style={
+                {
+                  "--dial-rotation": `${dialRotation}deg`,
+                  "--dial-counter-rotation": `${-dialRotation}deg`,
+                  "--dial-duration": `${activeDigit ? 160 + pulseCount(activeDigit) * 42 : 540}ms`,
+                } as React.CSSProperties
+              }
+            >
+              {DIAL_DIGITS.map((digit, index) => (
                 <button
                   type="button"
-                  key={performanceKey.note}
-                  className={pressed ? "is-pressed" : ""}
-                  aria-label={`${performanceKey.key}: play ${performanceKey.note}`}
-                  aria-pressed={pressed}
-                  onPointerDown={(event) => {
-                    event.currentTarget.setPointerCapture(event.pointerId);
-                    void noteOn(performanceKey);
-                  }}
-                  onPointerUp={() => noteOff(performanceKey.note)}
-                  onPointerCancel={() => noteOff(performanceKey.note)}
-                  onLostPointerCapture={() => noteOff(performanceKey.note)}
-                  onKeyDown={(event) => {
-                    if ((event.key === "Enter" || event.key === " ") && !event.repeat) {
-                      event.preventDefault();
-                      void noteOn(performanceKey);
-                    }
-                  }}
-                  onKeyUp={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      noteOff(performanceKey.note);
-                    }
-                  }}
+                  key={digit}
+                  className={`dial-number ${activeDigit === digit ? "is-active" : ""}`}
+                  style={
+                    {
+                      "--digit-angle": `${-48 + index * 36}deg`,
+                      "--digit-counter-angle": `${48 - index * 36}deg`,
+                    } as React.CSSProperties
+                  }
+                  aria-label={`Набрать цифру ${digit}`}
+                  disabled={dialPhase !== "idle"}
+                  onClick={() => { void dialDigit(digit); }}
                 >
-                  <span>{performanceKey.key}</span>
-                  <strong>{performanceKey.label}</strong>
+                  <span>{digit}</span>
                 </button>
-              );
-            })}
+              ))}
+
+              <div className="dial-center" aria-hidden="true">
+                <span>ЛИНИЯ</span><strong>425</strong><small>ГЦ</small>
+              </div>
+            </div>
+            <span className="dial-stop" aria-hidden="true"><i /></span>
+          </div>
+
+          <div className="phone-controls">
+            <label className="distance-control">
+              <span>ДАЛЬНОСТЬ</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={distance}
+                aria-label="Дальность линии"
+                onChange={(event) => setDistance(Number(event.target.value))}
+              />
+              <small><b>БЛИЗКО</b><b>ДАЛЕКО</b></small>
+            </label>
+
+            <button
+              type="button"
+              className="clear-button"
+              disabled={digits.length === 0 && !lineOpen}
+              onClick={clearNumber}
+            >
+              СБРОС НОМЕРА
+            </button>
+
+            <label className="master-control">
+              <span>ГРОМКОСТЬ</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={master}
+                aria-label="Громкость"
+                onChange={(event) => setMaster(Number(event.target.value))}
+              />
+              <output>{master}</output>
+            </label>
           </div>
         </section>
 
-        <footer className="nachklang-controls">
-          <div className="transport-controls" aria-label="Transport controls">
-            <button
-              type="button"
-              className={`transport-play ${playing ? "is-playing" : ""}`}
-              aria-label="Play the trace"
-              onPointerDown={() => { void unlockAudio().catch(() => {}); }}
-              onClick={() => { void startPlayback(); }}
-            >
-              <i aria-hidden="true" /><span>{playing ? "PLAYING" : "PLAY"}</span>
-            </button>
-            <button type="button" className="transport-stop" aria-label="Stop the trace" onClick={stopPlayback}>
-              <i aria-hidden="true" /><span>STOP</span>
-            </button>
-          </div>
-
-          <div className="memory-controls" aria-label="Trace memory controls">
-            <button
-              type="button"
-              className={`capture-button ${capturing ? "is-capturing" : ""}`}
-              aria-pressed={capturing}
-              onClick={capturing ? holdCapture : beginCapture}
-            >
-              <i aria-hidden="true" /><span>{capturing ? "HOLD" : "CAPTURE"}</span>
-            </button>
-            <button type="button" className="clear-button" onClick={clearTrace}>CLEAR TRACE</button>
-          </div>
-
-          <label className="master-control">
-            <span>MASTER</span>
-            <input
-              aria-label="Master volume"
-              type="range"
-              min="0"
-              max="100"
-              value={master}
-              onChange={(event) => setMaster(Number(event.target.value))}
-            />
-            <output>{master}</output>
-          </label>
-
-          <div className="tempo-mark" aria-label={`Fixed tempo ${TEMPO} beats per minute`}>
-            <span>TEMPO</span><strong>{TEMPO}</strong><small>BPM</small>
-          </div>
+        <footer className="line-footer">
+          <span>ЦИФРЫ 0–9 — НАБОР</span>
+          <span>SPACE — ТРУБКА</span>
+          <span>ESC — СБРОС</span>
+          <strong>{TEMPO} УД/МИН</strong>
         </footer>
 
-        {audioError ? <p className="nachklang-error" role="alert">{audioError}</p> : null}
+        {audioError ? <p className="line-error" role="alert">{audioError}</p> : null}
       </section>
     </main>
   );
